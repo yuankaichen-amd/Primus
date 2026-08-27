@@ -896,17 +896,25 @@ class PrimusTurboAttention(te.pytorch.DotProductAttention):
         packed_seq_params: PackedSeqParams = None,
     ):
         """Forward."""
-        packed_seq_kwargs = (
-            {key: getattr(packed_seq_params, key) for key in self.kept_packed_seq_params}
-            if packed_seq_params is not None
-            else {}
-        )
+        # Subclasses te.pytorch.DotProductAttention, not Megatron's
+        # TEDotProductAttention, so there is no kept_packed_seq_params.
+        packed_seq_kwargs = {}
+        if packed_seq_params is not None:
+            packed_seq_kwargs = {
+                "qkv_format": packed_seq_params.qkv_format,
+                "cu_seqlens_q": packed_seq_params.cu_seqlens_q,
+                "cu_seqlens_kv": packed_seq_params.cu_seqlens_kv,
+                "max_seqlen_q": packed_seq_params.max_seqlen_q,
+                "max_seqlen_kv": packed_seq_params.max_seqlen_kv,
+            }
 
-        qkv_format = packed_seq_kwargs.get("qkv_format", self.qkv_format)
+        qkv_format = packed_seq_kwargs.get("qkv_format") or self.qkv_format
         mask_type = attn_mask_type.name
-        if mask_type == AttnMaskType.causal.name:
+        # Miles packed (THD) RL sequences use padding_causal / padding; those
+        # are causal vs bidirectional on packed tokens, not a different kernel.
+        if mask_type in (AttnMaskType.causal.name, AttnMaskType.padding_causal.name):
             causal = True
-        elif mask_type == AttnMaskType.no_mask.name:
+        elif mask_type in (AttnMaskType.no_mask.name, AttnMaskType.padding.name):
             causal = False
         else:
             raise ValueError(f"Unsupported mask type: {mask_type}")
@@ -954,36 +962,78 @@ class PrimusTurboAttention(te.pytorch.DotProductAttention):
         key = key.contiguous()
         value = value.contiguous()
 
-        if qkv_format == "sbhd":
-            query = query.permute(1, 0, 2, 3)
-            key = key.permute(1, 0, 2, 3)
-            value = value.permute(1, 0, 2, 3)
-        elif qkv_format == "bhsd":
-            query = query.permute(0, 2, 1, 3)
-            key = key.permute(0, 2, 1, 3)
-            value = value.permute(0, 2, 1, 3)
+        if qkv_format == "thd":
+            if packed_seq_params is None:
+                raise ValueError("PrimusTurboAttention qkv_format=thd requires packed_seq_params")
+            if self.config.context_parallel_size > 1:
+                raise ValueError("PrimusTurboAttention does not support THD with context parallel > 1")
+            # Megatron packed attention is [t, h, d] or a dummy-batch [t, 1, h, d].
+            if query.dim() == 4 and query.size(1) == 1:
+                query = query.squeeze(1)
+                key = key.squeeze(1)
+                value = value.squeeze(1)
+            cu_seqlens_q = packed_seq_kwargs["cu_seqlens_q"]
+            cu_seqlens_k = packed_seq_kwargs.get("cu_seqlens_kv", cu_seqlens_q)
+            max_seqlen_q = packed_seq_kwargs.get("max_seqlen_q")
+            max_seqlen_k = packed_seq_kwargs.get("max_seqlen_kv", max_seqlen_q)
 
-        o = self.attn(
-            query,
-            key,
-            value,
-            dropout_p=0.0,
-            softmax_scale=self.softmax_scale,
-            causal=causal,
-            window_size=window_size,
-            bias=None,
-            alibi_slopes=None,
-            deterministic=self.deterministic_mode,
-            return_lse=False,
-            return_attn_probs=False,
-            sink=sink_tensor,  # PR 208: pass sink tensor to Primus-Turbo
-            **self.attn_kwargs,
-        )
+            def _as_int(value):
+                if value is None:
+                    raise ValueError("PrimusTurboAttention THD path requires max_seqlen_{q,kv}")
+                if torch.is_tensor(value):
+                    return int(value.item())
+                return int(value)
 
-        if qkv_format == "sbhd":
-            o = o.permute(1, 0, 2, 3)
-        elif qkv_format == "bhsd":
-            o = o.permute(0, 2, 1, 3)
+            o = primus_turbo_torch.ops.flash_attn_varlen_func(
+                query,
+                key,
+                value,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                _as_int(max_seqlen_q),
+                _as_int(max_seqlen_k),
+                dropout_p=0.0,
+                softmax_scale=self.softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                bias=None,
+                alibi_slopes=None,
+                deterministic=self.deterministic_mode,
+                return_lse=False,
+                return_attn_probs=False,
+                sink=sink_tensor,
+            )
+        else:
+            if qkv_format == "sbhd":
+                query = query.permute(1, 0, 2, 3)
+                key = key.permute(1, 0, 2, 3)
+                value = value.permute(1, 0, 2, 3)
+            elif qkv_format == "bhsd":
+                query = query.permute(0, 2, 1, 3)
+                key = key.permute(0, 2, 1, 3)
+                value = value.permute(0, 2, 1, 3)
+
+            o = self.attn(
+                query,
+                key,
+                value,
+                dropout_p=0.0,
+                softmax_scale=self.softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                bias=None,
+                alibi_slopes=None,
+                deterministic=self.deterministic_mode,
+                return_lse=False,
+                return_attn_probs=False,
+                sink=sink_tensor,  # PR 208: pass sink tensor to Primus-Turbo
+                **self.attn_kwargs,
+            )
+
+            if qkv_format == "sbhd":
+                o = o.permute(1, 0, 2, 3)
+            elif qkv_format == "bhsd":
+                o = o.permute(0, 2, 1, 3)
 
         o = o.view(o.shape[0], o.shape[1], -1)
 
